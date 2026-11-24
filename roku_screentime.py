@@ -128,28 +128,47 @@ def installed_apps(ip):
     return {a.get("id"): (a.text or "").strip() for a in root.findall("app") if a.get("id")}
 
 
+def local_ips():
+    """Every IPv4 address this computer has (ethernet and WiFi can be on different networks)."""
+    ips = []
+    try:
+        out = subprocess.run(["hostname", "-I"], capture_output=True, text=True, timeout=3).stdout
+        ips = [x for x in out.split() if "." in x and not x.startswith("127.")]
+    except Exception:
+        pass
+    return ips or [""]
+
+
 def discover(wait=3):
-    """Find Rokus on the network with SSDP."""
+    """Find Rokus with SSDP, searching on every network this computer is connected to."""
     msg = ("M-SEARCH * HTTP/1.1\r\nHost: 239.255.255.250:1900\r\n"
            'Man: "ssdp:discover"\r\nST: roku:ecp\r\nMX: 2\r\n\r\n').encode()
-    sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
-    sock.settimeout(wait)
+    socks = []
+    for ip in local_ips():
+        try:
+            sk = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+            if ip:
+                sk.bind((ip, 0))
+                sk.setsockopt(socket.IPPROTO_IP, socket.IP_MULTICAST_IF, socket.inet_aton(ip))
+            sk.setblocking(False)
+            sk.sendto(msg, ("239.255.255.250", 1900))
+            sk.sendto(msg, ("239.255.255.250", 1900))
+            socks.append(sk)
+        except OSError:
+            pass
     found = []
-    try:
-        sock.sendto(msg, ("239.255.255.250", 1900))
-        sock.sendto(msg, ("239.255.255.250", 1900))
-        end = time.time() + wait
-        while time.time() < end:
+    end = time.time() + wait
+    while time.time() < end:
+        for sk in socks:
             try:
-                data, addr = sock.recvfrom(2048)
-            except socket.timeout:
-                break
+                data, addr = sk.recvfrom(2048)
+            except OSError:
+                continue
             if b"roku" in data.lower() and addr[0] not in found:
                 found.append(addr[0])
-    except OSError:
-        pass
-    finally:
-        sock.close()
+        time.sleep(0.1)
+    for sk in socks:
+        sk.close()
     out = []
     for ip in found:
         try:
