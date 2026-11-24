@@ -34,6 +34,11 @@ ROKU_PORT = int(os.environ.get("ROKU_PORT", "8060"))
 DATA = os.environ.get(
     "SCREENTIME_DATA", os.path.join(os.path.expanduser("~"), ".roku_screentime.json")
 )
+UPDATE_URL = os.environ.get(
+    "SCREENTIME_UPDATE_URL",
+    "https://raw.githubusercontent.com/keubanks16/RokuScreenTime/main/roku_screentime.py",
+)
+ME = os.path.abspath(__file__)
 POLL_SECONDS = 5
 KEEP_DAYS = 14
 
@@ -379,6 +384,52 @@ def housekeeping():
             print("housekeeping error:", e, flush=True)
 
 
+# ---------------------------------------------------------------- self-update
+def version():
+    try:
+        with open(ME, "rb") as f:
+            return hashlib.sha1(f.read()).hexdigest()[:7]
+    except OSError:
+        return "unknown"
+
+
+def restart():
+    save(force=True)
+    os.execv(sys.executable, [sys.executable, ME])
+
+
+def update():
+    """Download the newest copy of this script, check it, swap it in and restart."""
+    try:
+        req = urllib.request.Request(UPDATE_URL + "?t=%d" % time.time(),
+                                     headers={"Cache-Control": "no-cache"})
+        with urllib.request.urlopen(req, timeout=20) as r:
+            new = r.read()
+    except Exception as e:
+        return {"error": "Couldn't download the update (%s). Is the Pi online?" % why(e)}
+    if hashlib.sha1(new).hexdigest()[:7] == version():
+        return {"ok": True, "message": "Already up to date."}
+    try:
+        if b"Roku Screen Time" not in new or b"def main()" not in new:
+            raise ValueError("not the app")
+        compile(new, ME, "exec")
+    except Exception:
+        return {"error": "The downloaded update looked broken, so nothing was changed."}
+    try:
+        with open(ME, "rb") as f:
+            old = f.read()
+        with open(ME + ".bak", "wb") as f:
+            f.write(old)
+        tmp = ME + ".new"
+        with open(tmp, "wb") as f:
+            f.write(new)
+        os.replace(tmp, ME)
+    except OSError as e:
+        return {"error": "Couldn't save the update: %s" % e}
+    threading.Timer(1.0, restart).start()
+    return {"ok": True, "restarting": True, "message": "Updated. Restarting..."}
+
+
 # ---------------------------------------------------------------- web
 def hash_pin(pin, salt):
     return hashlib.sha256((salt + pin).encode()).hexdigest()
@@ -435,7 +486,7 @@ def tv_state(tv):
 
 def state():
     with LOCK:
-        return {"tvs": [tv_state(tv) for tv in S["tvs"]]}
+        return {"tvs": [tv_state(tv) for tv in S["tvs"]], "version": VERSION}
 
 
 def do_action(a):
@@ -445,6 +496,9 @@ def do_action(a):
 
     if kind == "discover":
         return {"found": discover()}
+
+    if kind == "update":
+        return update()
 
     if kind == "change_pin":
         new = str(a.get("new", ""))
@@ -707,10 +761,16 @@ input.wide{width:100%;text-align:left}
     <div class="btns"><button class="sm" data-a='{"type":"reset_today"}'>Reset today</button><button class="sm stop" id="removeBtn">Remove this TV</button></div>
   </div>
   </div>
+
+  <div class="card">
+    <h2>App</h2>
+    <div class="btns" style="margin-top:0"><button id="updBtn">Get update and restart</button></div>
+    <div class="dim" id="updMsg" style="margin-top:8px"></div>
+  </div>
 </div>
 
 <script>
-var $=function(i){return document.getElementById(i)},pin="",setup=false,sel="",filledFor="",cur=null,removeArmed=0;
+var updBusy=false,$=function(i){return document.getElementById(i)},pin="",setup=false,sel="",filledFor="",cur=null,removeArmed=0;
 try{pin=localStorage.getItem("stpin")||"";sel=localStorage.getItem("sttv")||""}catch(e){}
 function api(path,body){
   return fetch(path,{method:body?"POST":"GET",headers:{"Content-Type":"application/json","X-Pin":pin},body:body?JSON.stringify(body):undefined})
@@ -754,6 +814,7 @@ function tvStatus(t){
 
 function render(s){
   var tvs=s.tvs;
+  if(!updBusy)$("updMsg").textContent="Version "+s.version;
   if(!tvs.some(function(t){return t.ip==sel}))sel=tvs.length?tvs[0].ip:"";
   var box=$("tvs");box.textContent="";
   tvs.forEach(function(t){
@@ -825,6 +886,13 @@ $("removeBtn").onclick=function(){
 });
 $("labelGo").onclick=function(){act({type:"rename",label:$("label").value});$("label").blur()};
 $("label").onkeydown=function(e){if(e.key=="Enter")$("labelGo").onclick()};
+$("updBtn").onclick=function(){
+  updBusy=true;$("updMsg").textContent="Checking for an update...";
+  api("/api/action",{type:"update"}).then(function(j){
+    $("updMsg").textContent=j.error||j.message||"";
+    if(j.restarting){setTimeout(function(){location.reload()},7000)}else{setTimeout(function(){updBusy=false},6000)}
+  }).catch(function(){$("updMsg").textContent="Couldn't reach the Pi.";updBusy=false});
+};
 $("addToggle").onclick=function(){$("addBox").classList.toggle("hide")};
 function addTv(ip){
   $("addMsg").textContent="Adding...";
@@ -873,6 +941,9 @@ WantedBy=multi-user.target
     subprocess.run(["systemctl", "enable", "--now", "roku-screentime"], check=True)
     print("Installed. It now starts on every boot.")
     print("Open  http://%s.local:%d  on your phone." % (socket.gethostname(), PORT))
+
+
+VERSION = version()  # the copy that is actually running
 
 
 def main():
