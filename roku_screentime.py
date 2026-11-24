@@ -41,6 +41,7 @@ KEEP_DAYS = 14
 TV_DEFAULTS = {
     "ip": "",
     "name": "",
+    "label": "",
     "limit_on": False,
     "limit_weekday": 120,
     "limit_weekend": 180,
@@ -55,7 +56,7 @@ TV_DEFAULTS = {
     "unlock_until": {},
     "apps": {},
 }
-RULE_KEYS = [k for k in TV_DEFAULTS if k not in ("ip", "name")]
+RULE_KEYS = [k for k in TV_DEFAULTS if k not in ("ip", "name", "label")]
 
 LOCK = threading.RLock()
 S = {"pin": None, "tvs": []}
@@ -413,7 +414,8 @@ def tv_state(tv):
             for i, n in tv["apps"].items()]
     apps.sort(key=lambda a: (not a["blocked"], a["name"].lower()))
     return {
-        "ip": tv["ip"], "name": tv["name"] or tv["ip"],
+        "ip": tv["ip"], "name": tv["label"] or tv["name"] or tv["ip"],
+        "label": tv["label"], "model": tv["name"],
         "live": dict(live(tv["ip"])),
         "limit_on": tv["limit_on"], "limit_weekday": tv["limit_weekday"],
         "limit_weekend": tv["limit_weekend"],
@@ -479,6 +481,8 @@ def do_action(a):
         now = time.time()
         if kind == "remove_tv":
             S["tvs"] = [t for t in S["tvs"] if t["ip"] != ip]
+        elif kind == "rename":
+            tv["label"] = " ".join(str(a.get("label", "")).split())[:30]
         elif kind == "settings":
             for k in ("limit_on", "bed_on"):
                 if k in a:
@@ -672,6 +676,12 @@ input.wide{width:100%;text-align:left}
   </div>
 
   <div class="card">
+    <h2>TV name</h2>
+    <div class="row" style="padding:0;border:0"><input id="label" class="wide" type="text" maxlength="30" placeholder="e.g. Kids Den"><button id="labelGo">Save</button></div>
+    <div class="dim" id="model" style="margin-top:6px"></div>
+  </div>
+
+  <div class="card">
     <h2>Daily limit</h2>
     <div class="row"><span>Limit on</span><label class="sw"><input type="checkbox" id="limit_on"><span></span></label></div>
     <div class="row"><span>Mon-Fri minutes</span><input type="number" id="limit_weekday" min="0" max="1440" inputmode="numeric"></div>
@@ -776,12 +786,14 @@ function render(s){
   else if(t.bedtime_now){st.className="pill stop";st.textContent="Bedtime"}
   else if(t.limit_on&&left<=0){st.className="pill stop";st.textContent="Time's up"}
   else{st.className="pill go";st.textContent="Allowed"}
+  $("model").textContent=t.model?("Roku calls it: "+t.model):"";
   $("pauseBtn").textContent=t.pause_until?"Resume rules":"Pause rules 1 hr";
   $("watching").textContent=tvStatus(t)+" ("+t.ip+")";
   $("last").textContent=L.last_action?("Last: "+L.last_action):"";
   if(filledFor!=t.ip){
     ["limit_on","bed_on"].forEach(function(k){$(k).checked=t[k]});
     ["limit_weekday","limit_weekend","bed_start","bed_end"].forEach(function(k){$(k).value=t[k]});
+    $("label").value=t.label;
     filledFor=t.ip;removeArmed=0;$("removeBtn").textContent="Remove this TV";
   }
   var ab=$("apps");ab.textContent="";
@@ -811,6 +823,8 @@ $("removeBtn").onclick=function(){
 ["limit_on","bed_on","limit_weekday","limit_weekend","bed_start","bed_end"].forEach(function(k){
   $(k).onchange=function(){var o={type:"settings"};o[k]=this.type=="checkbox"?this.checked:this.type=="number"?parseInt(this.value||"0",10):this.value;act(o)};
 });
+$("labelGo").onclick=function(){act({type:"rename",label:$("label").value});$("label").blur()};
+$("label").onkeydown=function(e){if(e.key=="Enter")$("labelGo").onclick()};
 $("addToggle").onclick=function(){$("addBox").classList.toggle("hide")};
 function addTv(ip){
   $("addMsg").textContent="Adding...";
