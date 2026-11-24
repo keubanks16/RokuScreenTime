@@ -123,7 +123,7 @@ def active_app(ip):
 
 
 def installed_apps(ip):
-    root = ET.fromstring(ecp(ip, "query/apps"))
+    root = ET.fromstring(ecp(ip, "query/apps", timeout=10))
     return {a.get("id"): (a.text or "").strip() for a in root.findall("app") if a.get("id")}
 
 
