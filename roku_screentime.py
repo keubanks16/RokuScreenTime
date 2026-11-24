@@ -227,6 +227,8 @@ def tick(dt):
 
     on = info["power"] == "PowerOn"
     with LOCK:
+        if S["roku_ip"] != ip:  # TV was switched while we were asking the old one
+            return
         LIVE.update(reachable=True, on=on, app_id=app_id, app_name=app_name,
                     tv_name=info["name"], is_tv=info["is_tv"], screensaver=saver)
         now = time.time()
