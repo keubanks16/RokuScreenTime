@@ -379,6 +379,7 @@ def do_action(a):
         elif kind == "set_roku":
             S["roku_ip"] = str(a.get("ip", "")).strip()
             S["apps"] = {}
+            LIVE.update(reachable=False, on=False, app_id=None, app_name="", tv_name="")
         elif kind == "change_pin":
             new = str(a.get("new", ""))
             if not (new.isdigit() and 4 <= len(new) <= 8):
@@ -407,7 +408,7 @@ def do_action(a):
                 S["apps"].update(apps)
             save(force=True)
         except Exception:
-            return {"error": "Could not reach a Roku at that address"}
+            return {"error": "Saved, but the Pi can't reach a Roku at that address. The TV may be off or on a different network than the Pi."}
     return {"ok": True}
 
 
