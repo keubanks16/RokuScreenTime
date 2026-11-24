@@ -2,8 +2,9 @@
 """
 Roku Screen Time
 ================
-Runs on a Raspberry Pi (or any always-on computer) on the same WiFi as a Roku TV.
-It watches what the TV is doing and enforces:
+Runs on a Raspberry Pi (or any always-on computer) that can reach your Roku TVs.
+It watches what each TV is doing and, per TV, enforces:
+  * a Lock button (TV is switched back off until you unlock it)
   * a daily time limit (separate weekday / weekend minutes)
   * blocked apps (a parent can unlock any of them for a while)
   * a bedtime lockout (TV is switched off during set hours)
@@ -11,7 +12,7 @@ The control panel is a web page served by this script: http://<pi-name>.local:80
 
 No extra packages needed - Python 3 standard library only.
 
-  python3 roku_screentime.py             run it
+  python3 roku_screentime.py                  run it
   sudo python3 roku_screentime.py --install   start automatically on every boot
 """
 import hashlib
@@ -36,13 +37,14 @@ DATA = os.environ.get(
 POLL_SECONDS = 5
 KEEP_DAYS = 14
 
-DEFAULTS = {
-    "pin": None,
-    "roku_ip": "",
-    "limit_on": True,
+# Rules are kept per TV. A newly added TV starts with every rule off.
+TV_DEFAULTS = {
+    "ip": "",
+    "name": "",
+    "limit_on": False,
     "limit_weekday": 120,
     "limit_weekend": 180,
-    "bed_on": True,
+    "bed_on": False,
     "bed_start": "20:30",
     "bed_end": "06:30",
     "blocked": [],
@@ -53,14 +55,33 @@ DEFAULTS = {
     "unlock_until": {},
     "apps": {},
 }
+RULE_KEYS = [k for k in TV_DEFAULTS if k not in ("ip", "name")]
 
 LOCK = threading.RLock()
-S = dict(DEFAULTS)
-LIVE = {"reachable": False, "on": False, "app_id": None, "app_name": "", "tv_name": "",
-        "is_tv": True, "last_action": "", "screensaver": False}
+S = {"pin": None, "tvs": []}
+LIVE = {}  # ip -> live status
 _dirty = False
 _last_save = 0.0
 _pin_fails = {"count": 0, "until": 0.0}
+
+
+def new_tv(ip, name=""):
+    tv = json.loads(json.dumps(TV_DEFAULTS))
+    tv["ip"], tv["name"] = ip, name
+    return tv
+
+
+def find_tv(ip):
+    for tv in S["tvs"]:
+        if tv["ip"] == ip:
+            return tv
+    return None
+
+
+def live(ip):
+    return LIVE.setdefault(ip, {"reachable": False, "on": False, "app_id": None, "app_name": "",
+                                "is_tv": True, "last_action": "", "screensaver": False,
+                                "ecp_mode": ""})
 
 
 # ---------------------------------------------------------------- storage
@@ -69,11 +90,21 @@ def load():
     try:
         with open(DATA) as f:
             saved = json.load(f)
-        merged = dict(DEFAULTS)
-        merged.update(saved)
-        S = merged
     except (OSError, ValueError):
-        S = json.loads(json.dumps(DEFAULTS))
+        saved = {}
+    tvs = []
+    for t in saved.get("tvs", []):
+        tv = new_tv(t.get("ip", ""))
+        tv.update(t)
+        if tv["ip"]:
+            tvs.append(tv)
+    if not tvs and saved.get("roku_ip"):  # upgrade from the single-TV version
+        tv = new_tv(saved["roku_ip"])
+        for k in RULE_KEYS:
+            if k in saved:
+                tv[k] = saved[k]
+        tvs.append(tv)
+    S = {"pin": saved.get("pin"), "tvs": tvs}
 
 
 def save(force=False):
@@ -128,6 +159,30 @@ def installed_apps(ip):
     return {a.get("id"): (a.text or "").strip() for a in root.findall("app") if a.get("id")}
 
 
+def why(e):
+    code = getattr(e, "code", None)
+    if code in (401, 403):
+        return ("the TV refused it (error %d). On the TV set Settings > System > Advanced system "
+                "settings > Control by mobile apps > Network access to Enabled (or Permissive)" % code)
+    return "error %s" % (code or type(e).__name__)
+
+
+def press(ip, key):
+    """Send a remote key. Returns None if it worked, else a reason."""
+    try:
+        ecp(ip, "keypress/" + key, post=True)
+        return None
+    except Exception as e:
+        return why(e)
+
+
+def tv_off(ip, is_tv):
+    err = press(ip, "Home")
+    if is_tv and not err:
+        err = press(ip, "PowerOff")
+    return err
+
+
 def local_ips():
     """Every IPv4 address this computer has (ethernet and WiFi can be on different networks)."""
     ips = []
@@ -172,28 +227,29 @@ def discover(wait=3):
     out = []
     for ip in found:
         try:
-            out.append({"ip": ip, "name": device_info(ip)["name"]})
+            name = device_info(ip)["name"]
         except Exception:
-            out.append({"ip": ip, "name": ip})
+            name = ip
+        out.append({"ip": ip, "name": name, "added": find_tv(ip) is not None})
     return out
 
 
 # ---------------------------------------------------------------- rules
-def limit_minutes_today():
+def limit_minutes_today(tv):
     weekend = datetime.now().weekday() >= 5
-    base = S["limit_weekend"] if weekend else S["limit_weekday"]
-    return int(base) + int(S["bonus"].get(today(), 0))
+    base = tv["limit_weekend"] if weekend else tv["limit_weekday"]
+    return int(base) + int(tv["bonus"].get(today(), 0))
 
 
-def used_seconds_today():
-    return sum(S["usage"].get(today(), {}).values())
+def used_seconds_today(tv):
+    return sum(tv["usage"].get(today(), {}).values())
 
 
-def in_bedtime(now=None):
+def in_bedtime(tv, now=None):
     now = now or datetime.now()
     try:
-        sh, sm = [int(x) for x in S["bed_start"].split(":")]
-        eh, em = [int(x) for x in S["bed_end"].split(":")]
+        sh, sm = [int(x) for x in tv["bed_start"].split(":")]
+        eh, em = [int(x) for x in tv["bed_end"].split(":")]
     except ValueError:
         return False
     cur, start, end = now.hour * 60 + now.minute, sh * 60 + sm, eh * 60 + em
@@ -204,113 +260,122 @@ def in_bedtime(now=None):
     return cur >= start or cur < end
 
 
-def why(e):
-    code = getattr(e, "code", None)
-    if code in (401, 403):
-        return ("the TV refused it (error %d). On the TV set Settings > System > Advanced system "
-                "settings > Control by mobile apps > Network access to Enabled (or Permissive)" % code)
-    return "error %s" % (code or type(e).__name__)
+def note(ip, text):
+    live(ip)["last_action"] = "%s - %s" % (datetime.now().strftime("%-I:%M %p"), text)
 
 
-def press(ip, key):
-    """Send a remote key. Returns None if it worked, else a reason."""
-    try:
-        ecp(ip, "keypress/" + key, post=True)
-        return None
-    except Exception as e:
-        return why(e)
-
-
-def tv_off(ip, is_tv):
-    err = press(ip, "Home")
-    if is_tv and not err:
-        err = press(ip, "PowerOff")
-    return err
-
-
-def note(text):
-    LIVE["last_action"] = "%s - %s" % (datetime.now().strftime("%-I:%M %p"), text)
-
-
-def tick(dt):
+def tick(ip, dt):
     global _dirty
-    ip = S["roku_ip"]
-    if not ip:
-        LIVE.update(reachable=False, on=False, app_id=None, app_name="")
-        return
+    L = live(ip)
     try:
         info = device_info(ip)
         app_id, app_name, saver = active_app(ip)
     except Exception:
-        LIVE.update(reachable=False, on=False, app_id=None, app_name="")
+        L.update(reachable=False, on=False, app_id=None, app_name="")
         return
 
     on = info["power"] == "PowerOn"
     with LOCK:
-        if S["roku_ip"] != ip:  # TV was switched while we were asking the old one
+        tv = find_tv(ip)
+        if tv is None:  # removed while we were asking it
             return
-        LIVE.update(reachable=True, on=on, app_id=app_id, app_name=app_name,
-                    tv_name=info["name"], is_tv=info["is_tv"], screensaver=saver,
-                    ecp_mode=info["ecp_mode"])
+        L.update(reachable=True, on=on, app_id=app_id, app_name=app_name,
+                 is_tv=info["is_tv"], screensaver=saver, ecp_mode=info["ecp_mode"])
         now = time.time()
-        if app_id and app_name and S["apps"].get(app_id) != app_name:
-            S["apps"][app_id] = app_name
+        if tv["name"] != info["name"]:
+            tv["name"] = info["name"]
+            _dirty = True
+        if app_id and app_name and tv["apps"].get(app_id) != app_name:
+            tv["apps"][app_id] = app_name
             _dirty = True
 
         if on and app_id and not saver:
-            day = S["usage"].setdefault(today(), {})
+            day = tv["usage"].setdefault(today(), {})
             day[app_id] = day.get(app_id, 0) + dt
             _dirty = True
 
         if not on:
             return
-        if S["tv_locked"]:
+        if tv["tv_locked"]:
             action = ("off", "TV is locked - turned it off")
-        elif S["pause_until"] > now:
+        elif tv["pause_until"] > now:
             return
-        elif S["bed_on"] and in_bedtime():
+        elif tv["bed_on"] and in_bedtime(tv):
             action = ("off", "Bedtime - turned the TV off")
-        elif S["limit_on"] and app_id and used_seconds_today() >= limit_minutes_today() * 60:
+        elif tv["limit_on"] and app_id and used_seconds_today(tv) >= limit_minutes_today(tv) * 60:
             action = ("off", "Daily limit reached - turned the TV off")
-        elif app_id in S["blocked"] and S["unlock_until"].get(app_id, 0) < now:
+        elif app_id in tv["blocked"] and tv["unlock_until"].get(app_id, 0) < now:
             action = ("home", "Blocked %s - sent the TV to Home" % (app_name or app_id))
         else:
             return
 
     err = tv_off(ip, info["is_tv"]) if action[0] == "off" else press(ip, "Home")
-    note("Tried to enforce a rule but " + err if err else action[1])
+    note(ip, "Tried to enforce a rule but " + err if err else action[1])
 
 
-def monitor():
+def refresh_apps(ip):
+    apps = installed_apps(ip)
+    with LOCK:
+        tv = find_tv(ip)
+        if tv is not None:
+            tv["apps"].update(apps)
+    save(force=True)
+
+
+def watch(ip, stop):
+    """One watcher thread per TV, so a TV that is off never slows down the others."""
     last = time.time()
     last_apps = 0.0
-    last_day = today()
-    while True:
+    while not stop.is_set():
         now = time.time()
         dt = min(now - last, POLL_SECONDS * 3)
         last = now
         try:
-            tick(dt)
-            if LIVE["reachable"] and now - last_apps > 300:
+            tick(ip, dt)
+            if live(ip)["reachable"] and now - last_apps > 300:
                 last_apps = now
                 try:
-                    apps = installed_apps(S["roku_ip"])
-                    with LOCK:
-                        S["apps"].update(apps)
-                    save(force=True)
+                    refresh_apps(ip)
                 except Exception as e:
-                    print("app list:", why(e), flush=True)
+                    print("app list %s: %s" % (ip, why(e)), flush=True)
+        except Exception as e:  # never let a watcher die
+            print("watch error %s: %s" % (ip, e), flush=True)
+        stop.wait(POLL_SECONDS)
+
+
+WATCHERS = {}  # ip -> stop event
+
+
+def sync_watchers():
+    with LOCK:
+        wanted = {tv["ip"] for tv in S["tvs"]}
+        for ip in list(WATCHERS):
+            if ip not in wanted:
+                WATCHERS.pop(ip).set()
+                LIVE.pop(ip, None)
+        for ip in wanted:
+            if ip not in WATCHERS:
+                stop = threading.Event()
+                WATCHERS[ip] = stop
+                threading.Thread(target=watch, args=(ip, stop), daemon=True).start()
+
+
+def housekeeping():
+    last_day = today()
+    while True:
+        time.sleep(30)
+        try:
             if today() != last_day:
                 last_day = today()
                 cutoff = (datetime.now() - timedelta(days=KEEP_DAYS)).strftime("%Y-%m-%d")
                 with LOCK:
-                    for key in ("usage", "bonus"):
-                        S[key] = {d: v for d, v in S[key].items() if d >= cutoff}
+                    for tv in S["tvs"]:
+                        for key in ("usage", "bonus"):
+                            tv[key] = {d: v for d, v in tv[key].items() if d >= cutoff}
                 save(force=True)
             save()
-        except Exception as e:  # never let the watcher die
-            print("monitor error:", e, flush=True)
-        time.sleep(POLL_SECONDS)
+        except Exception as e:
+            print("housekeeping error:", e, flush=True)
 
 
 # ---------------------------------------------------------------- web
@@ -340,116 +405,135 @@ def valid_time(t):
         return False
 
 
+def tv_state(tv):
+    now = time.time()
+    usage = tv["usage"].get(today(), {})
+    apps = [{"id": i, "name": n, "blocked": i in tv["blocked"],
+             "unlock_until": tv["unlock_until"].get(i, 0) if tv["unlock_until"].get(i, 0) > now else 0}
+            for i, n in tv["apps"].items()]
+    apps.sort(key=lambda a: (not a["blocked"], a["name"].lower()))
+    return {
+        "ip": tv["ip"], "name": tv["name"] or tv["ip"],
+        "live": dict(live(tv["ip"])),
+        "limit_on": tv["limit_on"], "limit_weekday": tv["limit_weekday"],
+        "limit_weekend": tv["limit_weekend"],
+        "bed_on": tv["bed_on"], "bed_start": tv["bed_start"], "bed_end": tv["bed_end"],
+        "bonus_today": tv["bonus"].get(today(), 0),
+        "limit_today": limit_minutes_today(tv),
+        "used_seconds": int(used_seconds_today(tv)),
+        "bedtime_now": bool(tv["bed_on"] and in_bedtime(tv)),
+        "pause_until": tv["pause_until"] if tv["pause_until"] > now else 0,
+        "tv_locked": bool(tv["tv_locked"]),
+        "apps": apps,
+        "usage": sorted(
+            [{"name": tv["apps"].get(i, i), "seconds": int(s)} for i, s in usage.items()],
+            key=lambda u: -u["seconds"]),
+    }
+
+
 def state():
     with LOCK:
-        now = time.time()
-        usage = S["usage"].get(today(), {})
-        apps = [{"id": i, "name": n, "blocked": i in S["blocked"],
-                 "unlock_until": S["unlock_until"].get(i, 0) if S["unlock_until"].get(i, 0) > now else 0}
-                for i, n in S["apps"].items()]
-        apps.sort(key=lambda a: (not a["blocked"], a["name"].lower()))
-        return {
-            "live": dict(LIVE),
-            "roku_ip": S["roku_ip"],
-            "limit_on": S["limit_on"], "limit_weekday": S["limit_weekday"],
-            "limit_weekend": S["limit_weekend"],
-            "bed_on": S["bed_on"], "bed_start": S["bed_start"], "bed_end": S["bed_end"],
-            "bonus_today": S["bonus"].get(today(), 0),
-            "limit_today": limit_minutes_today(),
-            "used_seconds": int(used_seconds_today()),
-            "bedtime_now": bool(S["bed_on"] and in_bedtime()),
-            "pause_until": S["pause_until"] if S["pause_until"] > now else 0,
-            "tv_locked": bool(S["tv_locked"]),
-            "now": now,
-            "apps": apps,
-            "usage": sorted(
-                [{"name": S["apps"].get(i, i), "seconds": int(s)} for i, s in usage.items()],
-                key=lambda u: -u["seconds"]),
-        }
+        return {"tvs": [tv_state(tv) for tv in S["tvs"]]}
 
 
 def do_action(a):
     global _dirty
     kind = a.get("type")
+    ip = str(a.get("tv", "")).strip()
+
+    if kind == "discover":
+        return {"found": discover()}
+
+    if kind == "change_pin":
+        new = str(a.get("new", ""))
+        if not (new.isdigit() and 4 <= len(new) <= 8):
+            return {"error": "PIN must be 4-8 digits"}
+        salt = secrets.token_hex(8)
+        with LOCK:
+            S["pin"] = {"salt": salt, "hash": hash_pin(new, salt)}
+        save(force=True)
+        return {"ok": True}
+
+    if kind == "add_tv":
+        if not ip:
+            return {"error": "Type the TV's address first"}
+        try:
+            info = device_info(ip)
+        except Exception:
+            return {"error": "The Pi can't reach a Roku at %s. Check the address and that the TV is on." % ip}
+        with LOCK:
+            if find_tv(ip) is None:
+                S["tvs"].append(new_tv(ip, info["name"]))
+        save(force=True)
+        sync_watchers()
+        try:
+            refresh_apps(ip)
+        except Exception as e:
+            return {"ok": True, "warning": "Added, but couldn't load its app list: " + why(e)}
+        return {"ok": True}
+
     with LOCK:
+        tv = find_tv(ip)
+        if tv is None:
+            return {"error": "Pick a TV first"}
         now = time.time()
-        if kind == "settings":
+        if kind == "remove_tv":
+            S["tvs"] = [t for t in S["tvs"] if t["ip"] != ip]
+        elif kind == "settings":
             for k in ("limit_on", "bed_on"):
                 if k in a:
-                    S[k] = bool(a[k])
+                    tv[k] = bool(a[k])
             for k in ("limit_weekday", "limit_weekend"):
                 if k in a:
-                    S[k] = max(0, min(1440, int(a[k])))
+                    tv[k] = max(0, min(1440, int(a[k])))
             for k in ("bed_start", "bed_end"):
                 if k in a and valid_time(a[k]):
-                    S[k] = a[k]
+                    tv[k] = a[k]
         elif kind == "bonus":
-            S["bonus"][today()] = max(0, S["bonus"].get(today(), 0) + int(a.get("minutes", 0)))
+            tv["bonus"][today()] = max(0, tv["bonus"].get(today(), 0) + int(a.get("minutes", 0)))
         elif kind == "pause":
-            S["pause_until"] = now + max(1, min(1440, int(a.get("minutes", 60)))) * 60
-            note("Rules paused by parent")
-        elif kind == "lock":
-            S["tv_locked"] = True
-            note("TV locked by parent")
-        elif kind == "unlock_tv":
-            S["tv_locked"] = False
-            note("TV unlocked by parent")
+            tv["pause_until"] = now + max(1, min(1440, int(a.get("minutes", 60)))) * 60
+            note(ip, "Rules paused by parent")
         elif kind == "resume":
-            S["pause_until"] = 0
-            S["unlock_until"] = {}
-            note("Rules back on")
+            tv["pause_until"] = 0
+            tv["unlock_until"] = {}
+            note(ip, "Rules back on")
+        elif kind == "lock":
+            tv["tv_locked"] = True
+            note(ip, "TV locked by parent")
+        elif kind == "unlock_tv":
+            tv["tv_locked"] = False
+            note(ip, "TV unlocked by parent")
         elif kind == "block":
             app = str(a.get("app", ""))
-            S["blocked"] = [x for x in S["blocked"] if x != app]
+            tv["blocked"] = [x for x in tv["blocked"] if x != app]
             if a.get("on"):
-                S["blocked"].append(app)
-            S["unlock_until"].pop(app, None)
+                tv["blocked"].append(app)
+            tv["unlock_until"].pop(app, None)
         elif kind == "unlock":
-            S["unlock_until"][str(a.get("app", ""))] = now + max(1, min(1440, int(a.get("minutes", 30)))) * 60
+            tv["unlock_until"][str(a.get("app", ""))] = now + max(1, min(1440, int(a.get("minutes", 30)))) * 60
         elif kind == "relock":
-            S["unlock_until"].pop(str(a.get("app", "")), None)
+            tv["unlock_until"].pop(str(a.get("app", "")), None)
         elif kind == "reset_today":
-            S["usage"].pop(today(), None)
-            S["bonus"].pop(today(), None)
-        elif kind == "set_roku":
-            S["roku_ip"] = str(a.get("ip", "")).strip()
-            S["apps"] = {}
-            LIVE.update(reachable=False, on=False, app_id=None, app_name="", tv_name="")
-        elif kind == "change_pin":
-            new = str(a.get("new", ""))
-            if not (new.isdigit() and 4 <= len(new) <= 8):
-                return {"error": "PIN must be 4-8 digits"}
-            salt = secrets.token_hex(8)
-            S["pin"] = {"salt": salt, "hash": hash_pin(new, salt)}
+            tv["usage"].pop(today(), None)
+            tv["bonus"].pop(today(), None)
         elif kind == "tv_off":
-            pass
-        elif kind == "discover":
             pass
         else:
             return {"error": "unknown action"}
         _dirty = True
     save(force=True)
-    if kind in ("lock", "tv_off") and S["roku_ip"]:
-        err = tv_off(S["roku_ip"], LIVE.get("is_tv", True))
-        if err:
-            note("Couldn't turn the TV off: " + err)
-            return {"error": "Couldn't turn the TV off: " + err}
-        if kind == "tv_off":
-            note("Turned off by parent")
-    if kind == "discover":
-        return {"found": discover()}
-    if kind == "set_roku" and S["roku_ip"]:
-        try:
-            device_info(S["roku_ip"])
-        except Exception:
-            return {"error": "Saved, but the Pi can't reach a Roku at that address. The TV may be off or on a different network than the Pi."}
-        try:
-            apps = installed_apps(S["roku_ip"])
-            with LOCK:
-                S["apps"].update(apps)
-            save(force=True)
-        except Exception as e:
-            return {"error": "Connected, but couldn't load the app list: " + why(e)}
+    if kind == "remove_tv":
+        sync_watchers()
+    if kind in ("lock", "tv_off"):
+        L = live(ip)
+        if L["reachable"] and L["on"]:
+            err = tv_off(ip, L.get("is_tv", True))
+            if err:
+                note(ip, "Couldn't turn the TV off: " + err)
+                return {"error": "Couldn't turn the TV off: " + err}
+            if kind == "tv_off":
+                note(ip, "Turned off by parent")
     return {"ok": True}
 
 
@@ -475,6 +559,7 @@ class Handler(BaseHTTPRequestHandler):
             self.send_response(200)
             self.send_header("Content-Type", "text/html; charset=utf-8")
             self.send_header("Content-Length", str(len(body)))
+            self.send_header("Cache-Control", "no-store")
             self.end_headers()
             self.wfile.write(body)
         elif self.path == "/api/state":
@@ -521,14 +606,16 @@ h2{font-size:13px;text-transform:uppercase;letter-spacing:1.2px;color:var(--dim)
 .row+.row{border-top:1px solid var(--line)}
 .big{font-size:40px;font-weight:700;letter-spacing:-1px;line-height:1}
 .dim{color:var(--dim);font-size:14px}
+.warn{color:var(--warn);font-size:14px;margin-top:6px}
 .bar{height:10px;background:var(--line);border-radius:6px;overflow:hidden;margin:12px 0 6px}
 .bar i{display:block;height:100%;background:var(--go);border-radius:6px;transition:width .4s}
 .pill{display:inline-block;padding:3px 10px;border-radius:20px;font-size:13px;font-weight:600;background:var(--line)}
-.pill.go{background:#1d3b2c;color:var(--go)}.pill.warn{background:#3d3219;color:var(--warn)}.pill.stop{background:#402024;color:var(--stop)}
+.pill.go{background:#1d3b2c;color:var(--go)}.pill.warn{background:#3d3219;color:var(--warn);margin:0}.pill.stop{background:#402024;color:var(--stop)}
 button{font:inherit;font-weight:600;color:var(--ink);background:var(--line);border:0;border-radius:11px;padding:10px 14px;cursor:pointer}
 button:active{transform:scale(.97)}
 button.pop{background:var(--pop);color:#14121f}button.stop{background:#402024;color:var(--stop)}
 button.sm{padding:6px 10px;font-size:13px}
+button.lk{min-width:96px;padding:14px 12px;font-size:16px;flex:none}
 .btns{display:flex;flex-wrap:wrap;gap:8px;margin-top:12px}
 input[type=number],input[type=time],input[type=text],input[type=password]{font:inherit;color:var(--ink);background:var(--bg);border:1px solid var(--line);border-radius:10px;padding:8px 10px;width:110px;text-align:center}
 input.wide{width:100%;text-align:left}
@@ -538,6 +625,9 @@ input.wide{width:100%;text-align:left}
 .sw span:before{content:"";position:absolute;width:24px;height:24px;left:3px;top:3px;background:#fff;border-radius:50%;transition:.2s}
 .sw input:checked+span{background:var(--pop)}.sw input:checked+span:before{transform:translateX(20px)}
 .app{flex:1;min-width:0}.app b{display:block;white-space:nowrap;overflow:hidden;text-overflow:ellipsis;font-weight:600}
+.tv{cursor:pointer;border-radius:12px;padding:10px;margin:0 -10px}
+.tv.sel{background:#272341}
+.tv+.tv{border-top:0}
 #msg{color:var(--stop);min-height:20px;font-size:14px;margin-top:8px}
 .hide{display:none}
 </style></head><body>
@@ -552,19 +642,24 @@ input.wide{width:100%;text-align:left}
 </div>
 
 <div id="main" class="hide">
-  <div class="card" id="find">
-    <h2>Your Roku TV</h2>
-    <div id="tvLine" class="dim"></div>
-    <div id="tvWarn" style="color:var(--warn);font-size:14px;margin-top:6px"></div>
-    <div class="btns"><button id="scan">Find my Roku</button></div>
-    <div id="found"></div>
-    <div class="row" style="border:0"><input id="ip" class="wide" type="text" placeholder="or type the TV's IP address"><button id="ipGo">Use</button></div>
+  <div class="card">
+    <h2>TVs</h2>
+    <div id="tvs"></div>
+    <div class="dim" id="tvHint"></div>
+    <div class="btns"><button class="sm" id="addToggle">Add a TV</button></div>
+    <div id="addBox" class="hide">
+      <div class="btns"><button id="scan">Find my Rokus</button></div>
+      <div id="found"></div>
+      <div class="row" style="border:0"><input id="ip" class="wide" type="text" inputmode="decimal" placeholder="or type the TV's IP address"><button id="ipGo">Add</button></div>
+      <div class="dim" id="addMsg"></div>
+    </div>
   </div>
 
+  <div id="detail" class="hide">
   <div class="card">
-    <h2>Today</h2>
-    <button id="lockBtn" class="stop" style="width:100%;padding:16px;font-size:18px;margin-bottom:14px">Lock TV</button>
-    <div class="row" style="padding-top:0"><div><div class="big" id="left">--</div><div class="dim" id="leftSub"></div></div><span class="pill" id="status"></span></div>
+    <h2 id="dName">Today</h2>
+    <div class="warn" id="tvWarn"></div>
+    <div class="row" style="padding-top:0;border:0"><div><div class="big" id="left">--</div><div class="dim" id="leftSub"></div></div><span class="pill" id="status"></span></div>
     <div class="bar"><i id="fill" style="width:0"></i></div>
     <div class="dim" id="watching"></div>
     <div class="dim" id="last"></div>
@@ -599,21 +694,23 @@ input.wide{width:100%;text-align:left}
   <div class="card">
     <h2>Watched today</h2>
     <div id="usage" class="dim">Nothing yet</div>
-    <div class="btns"><button class="sm" data-a='{"type":"reset_today"}'>Reset today</button></div>
+    <div class="btns"><button class="sm" data-a='{"type":"reset_today"}'>Reset today</button><button class="sm stop" id="removeBtn">Remove this TV</button></div>
+  </div>
   </div>
 </div>
 
 <script>
-var $=function(i){return document.getElementById(i)},pin="",setup=false,filled=false,timer=null,lastState=null;
-try{pin=localStorage.getItem("stpin")||""}catch(e){}
+var $=function(i){return document.getElementById(i)},pin="",setup=false,sel="",filledFor="",cur=null,removeArmed=0;
+try{pin=localStorage.getItem("stpin")||"";sel=localStorage.getItem("sttv")||""}catch(e){}
 function api(path,body){
   return fetch(path,{method:body?"POST":"GET",headers:{"Content-Type":"application/json","X-Pin":pin},body:body?JSON.stringify(body):undefined})
     .then(function(r){return r.json().then(function(j){j._status=r.status;return j})});
 }
-function act(a){return api("/api/action",a).then(function(j){refresh();if(j.error&&a.type!="set_roku"){$("last").textContent=j.error}return j})}
+function act(a,tv){a.tv=tv||a.tv||sel;return api("/api/action",a).then(function(j){refresh();if(j.error&&a.tv==sel){$("last").textContent=j.error}return j})}
 function mins(s){var m=Math.round(s/60);return m>=60?Math.floor(m/60)+"h "+(m%60)+"m":m+"m"}
 function clock(ts){return new Date(ts*1000).toLocaleTimeString([], {hour:"numeric",minute:"2-digit"})}
 function el(tag,cls,text){var e=document.createElement(tag);if(cls)e.className=cls;if(text!=null)e.textContent=text;return e}
+function pick(ip){sel=ip;try{localStorage.setItem("sttv",ip)}catch(e){}refresh()}
 
 function showGate(isSetup,err){
   setup=isSetup;$("main").classList.add("hide");$("gate").classList.remove("hide");
@@ -635,36 +732,61 @@ function refresh(fromGate){
     if(s.setup)return showGate(true);
     if(s._status==401)return showGate(false,fromGate?"Wrong PIN (5 misses locks it for a minute).":"");
     $("gate").classList.add("hide");$("main").classList.remove("hide");render(s);
-  }).catch(function(){$("watching").textContent="Can't reach the Pi right now."});
+  }).catch(function(){$("tvHint").textContent="Can't reach the Pi right now."});
+}
+
+function tvStatus(t){
+  var L=t.live;
+  if(!L.reachable)return "Off or not reachable";
+  if(!L.on)return "TV is off";
+  return L.app_id?("Now on: "+L.app_name+(L.screensaver?" (screensaver)":"")):"On the Home screen";
 }
 
 function render(s){
-  lastState=s;var L=s.live;
-  $("tvLine").textContent=s.roku_ip?(L.reachable?(L.tv_name+" ("+s.roku_ip+")"):"Can't reach the TV at "+s.roku_ip+" (it may be fully powered down)"):"No TV picked yet.";
+  var tvs=s.tvs;
+  if(!tvs.some(function(t){return t.ip==sel}))sel=tvs.length?tvs[0].ip:"";
+  var box=$("tvs");box.textContent="";
+  tvs.forEach(function(t){
+    var row=el("div","row tv"+(t.ip==sel&&tvs.length>1?" sel":"")),info=el("div","app");
+    info.appendChild(el("b",null,t.name));
+    info.appendChild(el("span","dim",(t.tv_locked?"Locked. ":"")+tvStatus(t)));
+    row.appendChild(info);
+    var b=el("button","lk "+(t.tv_locked?"pop":"stop"),t.tv_locked?"Unlock":"Lock");
+    b.onclick=function(e){e.stopPropagation();act({type:t.tv_locked?"unlock_tv":"lock"},t.ip)};
+    row.appendChild(b);
+    row.onclick=function(){pick(t.ip)};
+    box.appendChild(row);
+  });
+  $("tvHint").textContent=tvs.length?(tvs.length>1?"Tap a TV to see its limits below.":""):"No TVs yet. Add one to get started.";
+  if(!tvs.length)$("addBox").classList.remove("hide");
+  cur=tvs.filter(function(t){return t.ip==sel})[0]||null;
+  $("detail").classList.toggle("hide",!cur);
+  if(!cur)return;
+  var t=cur,L=t.live;
+  $("dName").textContent=t.name+" - today";
   $("tvWarn").textContent=(L.reachable&&(L.ecp_mode=="limited"||L.ecp_mode=="disabled"))?"This TV is set to block control ("+L.ecp_mode+" mode), so it can be watched but not locked. On the TV: Settings > System > Advanced system settings > Control by mobile apps > Network access > Enabled.":"";
-  var left=s.limit_today*60-s.used_seconds;
-  $("left").textContent=s.limit_on?(left>0?mins(left):"0m"):mins(s.used_seconds);
-  $("leftSub").textContent=s.limit_on?("left of "+mins(s.limit_today*60)+(s.bonus_today?" (incl. +"+s.bonus_today+" bonus)":"")):"watched today (no limit)";
-  var pct=s.limit_on&&s.limit_today?Math.min(100,100*s.used_seconds/(s.limit_today*60)):0;
+  var left=t.limit_today*60-t.used_seconds;
+  $("left").textContent=t.limit_on?(left>0?mins(left):"0m"):mins(t.used_seconds);
+  $("leftSub").textContent=t.limit_on?("left of "+mins(t.limit_today*60)+(t.bonus_today?" (incl. +"+t.bonus_today+" bonus)":"")):"watched today (no limit set)";
+  var pct=t.limit_on&&t.limit_today?Math.min(100,100*t.used_seconds/(t.limit_today*60)):0;
   $("fill").style.width=pct+"%";$("fill").style.background=pct>=100?"var(--stop)":pct>=80?"var(--warn)":"var(--go)";
   var st=$("status");
-  var lb=$("lockBtn");lb.textContent=s.tv_locked?"Unlock TV":"Lock TV";lb.className=s.tv_locked?"pop":"stop";
-  if(s.tv_locked){st.className="pill stop";st.textContent="Locked"}
-  else if(s.pause_until){st.className="pill warn";st.textContent="Paused till "+clock(s.pause_until)}
-  else if(s.bedtime_now){st.className="pill stop";st.textContent="Bedtime"}
-  else if(s.limit_on&&left<=0){st.className="pill stop";st.textContent="Time's up"}
+  if(t.tv_locked){st.className="pill stop";st.textContent="Locked"}
+  else if(t.pause_until){st.className="pill warn";st.textContent="Paused till "+clock(t.pause_until)}
+  else if(t.bedtime_now){st.className="pill stop";st.textContent="Bedtime"}
+  else if(t.limit_on&&left<=0){st.className="pill stop";st.textContent="Time's up"}
   else{st.className="pill go";st.textContent="Allowed"}
-  $("pauseBtn").textContent=s.pause_until?"Resume rules":"Pause rules 1 hr";
-  $("watching").textContent=!s.roku_ip?"":!L.reachable?"TV not reachable":!L.on?"TV is off":L.app_id?("Now on: "+L.app_name+(L.screensaver?" (screensaver)":"")):"On the Home screen";
+  $("pauseBtn").textContent=t.pause_until?"Resume rules":"Pause rules 1 hr";
+  $("watching").textContent=tvStatus(t)+" ("+t.ip+")";
   $("last").textContent=L.last_action?("Last: "+L.last_action):"";
-  if(!filled){
-    ["limit_on","bed_on"].forEach(function(k){$(k).checked=s[k]});
-    ["limit_weekday","limit_weekend","bed_start","bed_end"].forEach(function(k){$(k).value=s[k]});
-    filled=true;
+  if(filledFor!=t.ip){
+    ["limit_on","bed_on"].forEach(function(k){$(k).checked=t[k]});
+    ["limit_weekday","limit_weekend","bed_start","bed_end"].forEach(function(k){$(k).value=t[k]});
+    filledFor=t.ip;removeArmed=0;$("removeBtn").textContent="Remove this TV";
   }
-  var box=$("apps");box.textContent="";
-  if(!s.apps.length)box.appendChild(el("div","dim",s.roku_ip?"Apps show up once the TV is reachable.":"Pick your TV first."));
-  s.apps.forEach(function(a){
+  var ab=$("apps");ab.textContent="";
+  if(!t.apps.length)ab.appendChild(el("div","dim","Apps show up once the TV is on and allows control."));
+  t.apps.forEach(function(a){
     var row=el("div","row"),info=el("div","app");info.appendChild(el("b",null,a.name));
     if(a.blocked){
       info.appendChild(el("span","dim",a.unlock_until?"Allowed till "+clock(a.unlock_until):"Blocked"));
@@ -674,28 +796,39 @@ function render(s){
     }else row.appendChild(info);
     var sw=el("label","sw"),cb=el("input");cb.type="checkbox";cb.checked=a.blocked;
     cb.onchange=function(){act({type:"block",app:a.id,on:cb.checked})};
-    sw.appendChild(cb);sw.appendChild(el("span"));row.appendChild(sw);box.appendChild(row);
+    sw.appendChild(cb);sw.appendChild(el("span"));row.appendChild(sw);ab.appendChild(row);
   });
-  var u=$("usage");u.textContent=s.usage.length?"":"Nothing yet";
-  s.usage.forEach(function(x){var r=el("div","row");r.appendChild(el("span",null,x.name));r.appendChild(el("span","dim",mins(x.seconds)));u.appendChild(r)});
+  var u=$("usage");u.textContent=t.usage.length?"":"Nothing yet";
+  t.usage.forEach(function(x){var r=el("div","row");r.appendChild(el("span",null,x.name));r.appendChild(el("span","dim",mins(x.seconds)));u.appendChild(r)});
 }
 
 document.addEventListener("click",function(e){var a=e.target.getAttribute&&e.target.getAttribute("data-a");if(a)act(JSON.parse(a))});
-$("lockBtn").onclick=function(){act({type:lastState&&lastState.tv_locked?"unlock_tv":"lock"})};
-$("pauseBtn").onclick=function(){act(lastState&&lastState.pause_until?{type:"resume"}:{type:"pause",minutes:60})};
+$("pauseBtn").onclick=function(){act(cur&&cur.pause_until?{type:"resume"}:{type:"pause",minutes:60})};
+$("removeBtn").onclick=function(){
+  if(Date.now()-removeArmed<4000){removeArmed=0;act({type:"remove_tv"})}
+  else{removeArmed=Date.now();this.textContent="Tap again to remove"}
+};
 ["limit_on","bed_on","limit_weekday","limit_weekend","bed_start","bed_end"].forEach(function(k){
   $(k).onchange=function(){var o={type:"settings"};o[k]=this.type=="checkbox"?this.checked:this.type=="number"?parseInt(this.value||"0",10):this.value;act(o)};
 });
+$("addToggle").onclick=function(){$("addBox").classList.toggle("hide")};
+function addTv(ip){
+  $("addMsg").textContent="Adding...";
+  api("/api/action",{type:"add_tv",tv:ip}).then(function(j){
+    $("addMsg").textContent=j.error||j.warning||"Added.";
+    if(!j.error){$("ip").value="";pick(ip);$("found").textContent=""}
+  });
+}
 $("scan").onclick=function(){
   var f=$("found");f.textContent="Searching...";
   api("/api/action",{type:"discover"}).then(function(j){
-    f.textContent=(j.found&&j.found.length)?"":"No Roku answered. Make sure the TV is on, then try again or type its IP.";
-    (j.found||[]).forEach(function(d){var r=el("div","row");r.appendChild(el("span",null,d.name+" - "+d.ip));var b=el("button","sm pop","Use");
-      b.onclick=function(){pick(d.ip)};r.appendChild(b);f.appendChild(r)});
+    var list=(j.found||[]).filter(function(d){return !d.added});
+    f.textContent=list.length?"":((j.found||[]).length?"No new Rokus found. The ones that answered are already added.":"No Roku answered. Make sure the TV is on, or type its IP address.");
+    list.forEach(function(d){var r=el("div","row");r.appendChild(el("span",null,d.name+" - "+d.ip));var b=el("button","sm pop","Add");
+      b.onclick=function(){addTv(d.ip)};r.appendChild(b);f.appendChild(r)});
   });
 };
-function pick(ip){act({type:"set_roku",ip:ip}).then(function(j){$("found").textContent=j.error||"Saved."})}
-$("ipGo").onclick=function(){if($("ip").value.trim())pick($("ip").value.trim())};
+$("ipGo").onclick=function(){if($("ip").value.trim())addTv($("ip").value.trim())};
 refresh();setInterval(refresh,5000);
 </script></body></html>
 """
@@ -732,7 +865,8 @@ def main():
     if "--install" in sys.argv:
         return install()
     load()
-    threading.Thread(target=monitor, daemon=True).start()
+    sync_watchers()
+    threading.Thread(target=housekeeping, daemon=True).start()
     print("Roku Screen Time running: http://%s.local:%d" % (socket.gethostname(), PORT), flush=True)
     try:
         ThreadingHTTPServer(("0.0.0.0", PORT), Handler).serve_forever()
