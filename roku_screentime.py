@@ -111,6 +111,7 @@ def device_info(ip):
         "name": get("user-device-name") or get("friendly-device-name") or get("model-name") or ip,
         "power": get("power-mode") or "PowerOn",
         "is_tv": get("is-tv").lower() == "true",
+        "ecp_mode": get("ecp-setting-mode").lower(),
     }
 
 
@@ -188,7 +189,7 @@ def why(e):
     code = getattr(e, "code", None)
     if code in (401, 403):
         return ("the TV refused it (error %d). On the TV set Settings > System > Advanced system "
-                "settings > Control by mobile apps > Network access to Permissive" % code)
+                "settings > Control by mobile apps > Network access to Enabled (or Permissive)" % code)
     return "error %s" % (code or type(e).__name__)
 
 
@@ -230,7 +231,8 @@ def tick(dt):
         if S["roku_ip"] != ip:  # TV was switched while we were asking the old one
             return
         LIVE.update(reachable=True, on=on, app_id=app_id, app_name=app_name,
-                    tv_name=info["name"], is_tv=info["is_tv"], screensaver=saver)
+                    tv_name=info["name"], is_tv=info["is_tv"], screensaver=saver,
+                    ecp_mode=info["ecp_mode"])
         now = time.time()
         if app_id and app_name and S["apps"].get(app_id) != app_name:
             S["apps"][app_id] = app_name
@@ -534,6 +536,7 @@ input.wide{width:100%;text-align:left}
   <div class="card" id="find">
     <h2>Your Roku TV</h2>
     <div id="tvLine" class="dim"></div>
+    <div id="tvWarn" style="color:var(--warn);font-size:14px;margin-top:6px"></div>
     <div class="btns"><button id="scan">Find my Roku</button></div>
     <div id="found"></div>
     <div class="row" style="border:0"><input id="ip" class="wide" type="text" placeholder="or type the TV's IP address"><button id="ipGo">Use</button></div>
@@ -619,6 +622,7 @@ function refresh(fromGate){
 function render(s){
   lastState=s;var L=s.live;
   $("tvLine").textContent=s.roku_ip?(L.reachable?(L.tv_name+" ("+s.roku_ip+")"):"Can't reach the TV at "+s.roku_ip+" (it may be fully powered down)"):"No TV picked yet.";
+  $("tvWarn").textContent=(L.reachable&&(L.ecp_mode=="limited"||L.ecp_mode=="disabled"))?"This TV is set to block control ("+L.ecp_mode+" mode), so it can be watched but not locked. On the TV: Settings > System > Advanced system settings > Control by mobile apps > Network access > Enabled.":"";
   var left=s.limit_today*60-s.used_seconds;
   $("left").textContent=s.limit_on?(left>0?mins(left):"0m"):mins(s.used_seconds);
   $("leftSub").textContent=s.limit_on?("left of "+mins(s.limit_today*60)+(s.bonus_today?" (incl. +"+s.bonus_today+" bonus)":"")):"watched today (no limit)";
