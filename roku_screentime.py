@@ -184,13 +184,28 @@ def in_bedtime(now=None):
     return cur >= start or cur < end
 
 
-def tv_off(ip, is_tv):
+def why(e):
+    code = getattr(e, "code", None)
+    if code in (401, 403):
+        return ("the TV refused it (error %d). On the TV set Settings > System > Advanced system "
+                "settings > Control by mobile apps > Network access to Permissive" % code)
+    return "error %s" % (code or type(e).__name__)
+
+
+def press(ip, key):
+    """Send a remote key. Returns None if it worked, else a reason."""
     try:
-        ecp(ip, "keypress/Home", post=True)
-        if is_tv:
-            ecp(ip, "keypress/PowerOff", post=True)
-    except Exception:
-        pass
+        ecp(ip, "keypress/" + key, post=True)
+        return None
+    except Exception as e:
+        return why(e)
+
+
+def tv_off(ip, is_tv):
+    err = press(ip, "Home")
+    if is_tv and not err:
+        err = press(ip, "PowerOff")
+    return err
 
 
 def note(text):
@@ -239,14 +254,8 @@ def tick(dt):
         else:
             return
 
-    if action[0] == "off":
-        tv_off(ip, info["is_tv"])
-    else:
-        try:
-            ecp(ip, "keypress/Home", post=True)
-        except Exception:
-            pass
-    note(action[1])
+    err = tv_off(ip, info["is_tv"]) if action[0] == "off" else press(ip, "Home")
+    note("Tried to enforce a rule but " + err if err else action[1])
 
 
 def monitor():
@@ -260,11 +269,14 @@ def monitor():
         try:
             tick(dt)
             if LIVE["reachable"] and now - last_apps > 300:
-                apps = installed_apps(S["roku_ip"])
-                with LOCK:
-                    S["apps"].update(apps)
                 last_apps = now
-                save(force=True)
+                try:
+                    apps = installed_apps(S["roku_ip"])
+                    with LOCK:
+                        S["apps"].update(apps)
+                    save(force=True)
+                except Exception as e:
+                    print("app list:", why(e), flush=True)
             if today() != last_day:
                 last_day = today()
                 cutoff = (datetime.now() - timedelta(days=KEEP_DAYS)).strftime("%Y-%m-%d")
@@ -394,21 +406,27 @@ def do_action(a):
             return {"error": "unknown action"}
         _dirty = True
     save(force=True)
-    if kind == "lock" and S["roku_ip"]:
-        tv_off(S["roku_ip"], LIVE.get("is_tv", True))
-    if kind == "tv_off" and S["roku_ip"]:
-        tv_off(S["roku_ip"], LIVE.get("is_tv", True))
-        note("Turned off by parent")
+    if kind in ("lock", "tv_off") and S["roku_ip"]:
+        err = tv_off(S["roku_ip"], LIVE.get("is_tv", True))
+        if err:
+            note("Couldn't turn the TV off: " + err)
+            return {"error": "Couldn't turn the TV off: " + err}
+        if kind == "tv_off":
+            note("Turned off by parent")
     if kind == "discover":
         return {"found": discover()}
     if kind == "set_roku" and S["roku_ip"]:
+        try:
+            device_info(S["roku_ip"])
+        except Exception:
+            return {"error": "Saved, but the Pi can't reach a Roku at that address. The TV may be off or on a different network than the Pi."}
         try:
             apps = installed_apps(S["roku_ip"])
             with LOCK:
                 S["apps"].update(apps)
             save(force=True)
-        except Exception:
-            return {"error": "Saved, but the Pi can't reach a Roku at that address. The TV may be off or on a different network than the Pi."}
+        except Exception as e:
+            return {"error": "Connected, but couldn't load the app list: " + why(e)}
     return {"ok": True}
 
 
@@ -568,7 +586,7 @@ function api(path,body){
   return fetch(path,{method:body?"POST":"GET",headers:{"Content-Type":"application/json","X-Pin":pin},body:body?JSON.stringify(body):undefined})
     .then(function(r){return r.json().then(function(j){j._status=r.status;return j})});
 }
-function act(a){return api("/api/action",a).then(function(j){refresh();return j})}
+function act(a){return api("/api/action",a).then(function(j){refresh();if(j.error&&a.type!="set_roku"){$("last").textContent=j.error}return j})}
 function mins(s){var m=Math.round(s/60);return m>=60?Math.floor(m/60)+"h "+(m%60)+"m":m+"m"}
 function clock(ts){return new Date(ts*1000).toLocaleTimeString([], {hour:"numeric",minute:"2-digit"})}
 function el(tag,cls,text){var e=document.createElement(tag);if(cls)e.className=cls;if(text!=null)e.textContent=text;return e}
