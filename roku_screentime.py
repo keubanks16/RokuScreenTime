@@ -8,6 +8,7 @@ It watches what each TV is doing and, per TV, enforces:
   * a daily time limit (separate weekday / weekend minutes)
   * blocked apps (a parent can unlock any of them for a while)
   * a bedtime lockout (TV is switched off during set hours)
+It also has an AirPlay helper: one tap wakes the TV so you can mirror your iPhone to it.
 The control panel is a web page served by this script: http://<pi-name>.local:8080
 
 No extra packages needed - Python 3 standard library only.
@@ -87,7 +88,7 @@ def find_tv(ip):
 def live(ip):
     return LIVE.setdefault(ip, {"reachable": False, "on": False, "app_id": None, "app_name": "",
                                 "is_tv": True, "last_action": "", "screensaver": False,
-                                "ecp_mode": ""})
+                                "ecp_mode": "", "airplay": ""})
 
 
 # ---------------------------------------------------------------- storage
@@ -149,6 +150,7 @@ def device_info(ip):
         "power": get("power-mode") or "PowerOn",
         "is_tv": get("is-tv").lower() == "true",
         "ecp_mode": get("ecp-setting-mode").lower(),
+        "airplay": get("supports-airplay").lower(),  # "true", "false" or "" (TV didn't say)
     }
 
 
@@ -286,7 +288,8 @@ def tick(ip, dt):
         if tv is None:  # removed while we were asking it
             return
         L.update(reachable=True, on=on, app_id=app_id, app_name=app_name,
-                 is_tv=info["is_tv"], screensaver=saver, ecp_mode=info["ecp_mode"])
+                 is_tv=info["is_tv"], screensaver=saver, ecp_mode=info["ecp_mode"],
+                 airplay=info["airplay"])
         now = time.time()
         if tv["name"] != info["name"]:
             tv["name"] = info["name"]
@@ -533,6 +536,7 @@ def do_action(a):
         if tv is None:
             return {"error": "Pick a TV first"}
         now = time.time()
+        paused = False
         if kind == "remove_tv":
             S["tvs"] = [t for t in S["tvs"] if t["ip"] != ip]
         elif kind == "rename":
@@ -577,12 +581,28 @@ def do_action(a):
             tv["bonus"].pop(today(), None)
         elif kind == "tv_off":
             pass
+        elif kind == "airplay":
+            if tv["tv_locked"]:
+                return {"error": "This TV is locked. Tap Unlock first, then try again."}
+            blocked_now = (tv["bed_on"] and in_bedtime(tv)) or (
+                tv["limit_on"] and used_seconds_today(tv) >= limit_minutes_today(tv) * 60)
+            if blocked_now and tv["pause_until"] <= now:
+                tv["pause_until"] = now + 3600  # otherwise bedtime / the limit switches it straight off
+                paused = True
         else:
             return {"error": "unknown action"}
         _dirty = True
     save(force=True)
     if kind == "remove_tv":
         sync_watchers()
+    if kind == "airplay":
+        err = press(ip, "PowerOn" if live(ip).get("is_tv", True) else "Home")
+        if err:
+            return {"error": "Couldn't wake the TV (%s). Turn it on with its remote, "
+                             "then mirror from your phone." % err}
+        note(ip, "Woken for AirPlay" + (" - rules paused 1 hr" if paused else ""))
+        return {"ok": True, "message": "TV is on and ready." + (
+            " Rules are paused for 1 hour so it stays on." if paused else "")}
     if kind in ("lock", "tv_off"):
         L = live(ip)
         if L["reachable"] and L["on"]:
@@ -686,6 +706,7 @@ input.wide{width:100%;text-align:left}
 .tv{cursor:pointer;border-radius:12px;padding:10px;margin:0 -10px}
 .tv.sel{background:#272341}
 .tv+.tv{border-top:0}
+ol.steps{margin:12px 0 0;padding-left:22px}ol.steps li{margin:6px 0}
 #msg{color:var(--stop);min-height:20px;font-size:14px;margin-top:8px}
 .hide{display:none}
 </style></head><body>
@@ -730,6 +751,20 @@ input.wide{width:100%;text-align:left}
   </div>
 
   <div class="card">
+    <h2>AirPlay from your phone</h2>
+    <div class="dim" id="airInfo"></div>
+    <div class="btns"><button class="pop" id="airBtn">Get TV ready for AirPlay</button></div>
+    <div class="dim" id="airMsg" style="margin-top:8px"></div>
+    <ol class="steps">
+      <li>Put your iPhone on the <b>same WiFi</b> as this TV.</li>
+      <li>Swipe down from the top-right corner of your iPhone and tap <b>Screen Mirroring</b> (the two rectangles).</li>
+      <li>Pick <b id="airName">this TV</b>. The first time, type the code the TV shows.</li>
+    </ol>
+    <div class="dim" style="margin-top:10px">Just one video or photo? Tap the AirPlay or Share button inside the app instead. To stop, open Screen Mirroring again and tap Stop Mirroring.</div>
+    <div class="dim" style="margin-top:6px">TV not in the list? On the TV go to Settings &gt; Apple AirPlay and HomeKit and set AirPlay to On.</div>
+  </div>
+
+  <div class="card">
     <h2>TV name</h2>
     <div class="row" style="padding:0;border:0"><input id="label" class="wide" type="text" maxlength="30" placeholder="e.g. Kids Den"><button id="labelGo">Save</button></div>
     <div class="dim" id="model" style="margin-top:6px"></div>
@@ -770,7 +805,7 @@ input.wide{width:100%;text-align:left}
 </div>
 
 <script>
-var updBusy=false,$=function(i){return document.getElementById(i)},pin="",setup=false,sel="",filledFor="",cur=null,removeArmed=0;
+var airFor="",updBusy=false,$=function(i){return document.getElementById(i)},pin="",setup=false,sel="",filledFor="",cur=null,removeArmed=0;
 try{pin=localStorage.getItem("stpin")||"";sel=localStorage.getItem("sttv")||""}catch(e){}
 function api(path,body){
   return fetch(path,{method:body?"POST":"GET",headers:{"Content-Type":"application/json","X-Pin":pin},body:body?JSON.stringify(body):undefined})
@@ -847,6 +882,9 @@ function render(s){
   else if(t.bedtime_now){st.className="pill stop";st.textContent="Bedtime"}
   else if(t.limit_on&&left<=0){st.className="pill stop";st.textContent="Time's up"}
   else{st.className="pill go";st.textContent="Allowed"}
+  $("airName").textContent=t.model||t.name;
+  $("airInfo").textContent=L.airplay=="true"?"This TV supports AirPlay. Tap the button to wake it, then mirror from your iPhone.":L.airplay=="false"?"This Roku says it does not support AirPlay, so your iPhone won't be able to find it.":"Tap the button to wake the TV, then mirror from your iPhone.";
+  if(airFor!=t.ip){airFor=t.ip;$("airMsg").textContent=""}
   $("model").textContent=t.model?("Roku calls it: "+t.model):"";
   $("pauseBtn").textContent=t.pause_until?"Resume rules":"Pause rules 1 hr";
   $("watching").textContent=tvStatus(t)+" ("+t.ip+")";
@@ -877,6 +915,10 @@ function render(s){
 
 document.addEventListener("click",function(e){var a=e.target.getAttribute&&e.target.getAttribute("data-a");if(a)act(JSON.parse(a))});
 $("pauseBtn").onclick=function(){act(cur&&cur.pause_until?{type:"resume"}:{type:"pause",minutes:60})};
+$("airBtn").onclick=function(){
+  $("airMsg").textContent="Waking the TV...";
+  act({type:"airplay"}).then(function(j){$("airMsg").textContent=j.error||j.message||""}).catch(function(){$("airMsg").textContent="Couldn't reach the Pi."});
+};
 $("removeBtn").onclick=function(){
   if(Date.now()-removeArmed<4000){removeArmed=0;act({type:"remove_tv"})}
   else{removeArmed=Date.now();this.textContent="Tap again to remove"}
